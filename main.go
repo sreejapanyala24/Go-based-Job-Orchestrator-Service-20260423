@@ -11,7 +11,6 @@ import (
 )
 
 func main() {
-
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
@@ -49,12 +48,14 @@ func main() {
 		sig := <-sigCh
 		logger.Info("signal received, shutting down", "signal", sig)
 
-		svc.Stop()
+		httpCtx, httpCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer httpCancel()
+		if err := srv.Shutdown(httpCtx); err != nil {
+			logger.Error("HTTP server shutdown error", "error", err)
+		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(ctx); err != nil {
-			logger.Error("server shutdown error", "error", err)
+		if err := svc.GracefulStop(20 * time.Second); err != nil {
+			logger.Warn("job service did not drain cleanly", "error", err)
 		}
 	}()
 
