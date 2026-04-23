@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -91,6 +92,7 @@ func (s *JobService) Submit(jobType string) (*Job, error) {
 		s.mu.Unlock()
 		return nil, ErrServiceShutdown
 	default:
+		// Queue full — treat as a 503 at the handler layer.
 		s.mu.Lock()
 		delete(s.jobs, job.ID)
 		s.mu.Unlock()
@@ -117,6 +119,9 @@ func (s *JobService) ListJobs() []Job {
 	for _, j := range s.jobs {
 		out = append(out, *j)
 	}
+	slices.SortFunc(out, func(a, b Job) int {
+		return b.CreatedAt.Compare(a.CreatedAt)
+	})
 	return out
 }
 
@@ -159,7 +164,6 @@ func (s *JobService) Stop() {
 	s.once.Do(func() {
 		s.logger.Info("service shutting down")
 		close(s.shutdown)
-		// Close the channel so workers exit their range loop.
 		close(s.queue)
 		s.wg.Wait()
 		s.logger.Info("service shutdown complete")
@@ -168,6 +172,7 @@ func (s *JobService) Stop() {
 
 func (s *JobService) worker(id int) {
 	defer s.wg.Done()
+
 	defer func() {
 		if r := recover(); r != nil {
 			s.logger.Error("worker recovered from panic",
