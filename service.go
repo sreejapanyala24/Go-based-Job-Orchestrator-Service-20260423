@@ -92,7 +92,6 @@ func (s *JobService) Submit(jobType string) (*Job, error) {
 		s.mu.Unlock()
 		return nil, ErrServiceShutdown
 	default:
-		// Queue full — treat as a 503 at the handler layer.
 		s.mu.Lock()
 		delete(s.jobs, job.ID)
 		s.mu.Unlock()
@@ -160,14 +159,40 @@ func (s *JobService) Ready() bool {
 	}
 }
 
+func (s *JobService) GracefulStop(timeout time.Duration) error {
+	s.once.Do(func() {
+		s.logger.Info("service shutting down")
+		close(s.shutdown)
+		close(s.queue)
+	})
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+		s.logger.Info("service shutdown complete")
+		return nil
+	case <-timer.C:
+		s.logger.Warn("graceful shutdown timed out", "timeout", timeout)
+		return errors.New("graceful shutdown timed out: workers did not finish")
+	}
+}
+
 func (s *JobService) Stop() {
 	s.once.Do(func() {
 		s.logger.Info("service shutting down")
 		close(s.shutdown)
 		close(s.queue)
-		s.wg.Wait()
-		s.logger.Info("service shutdown complete")
 	})
+	s.wg.Wait()
+	s.logger.Info("service shutdown complete")
 }
 
 func (s *JobService) worker(id int) {
