@@ -37,7 +37,7 @@ func main() {
 	mux.HandleFunc("GET /health", h.Health)
 	mux.HandleFunc("GET /ready", h.Ready)
 
-	addr := envOr("ADDR", ":8080")
+	addr := envOr("ADDR", ":8000")
 	srv := &http.Server{
 		Addr:         addr,
 		Handler:      h.LoggingMiddleware(mux),

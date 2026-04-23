@@ -95,6 +95,11 @@ func (s *JobService) Submit(jobType string) (*Job, error) {
 		UpdatedAt: time.Now().UTC(),
 	}
 
+	// FIX (race): snapshot is taken HERE, while only this goroutine holds the
+	// pointer. After s.queue <- job below, a worker may pick it up and mutate
+	// Status/UpdatedAt concurrently. Any copy taken after that point races.
+	snapshot := *job
+
 	s.mu.Lock()
 	s.jobs[job.ID] = job
 	s.mu.Unlock()
@@ -119,7 +124,9 @@ func (s *JobService) Submit(jobType string) (*Job, error) {
 		return nil, errors.New("job queue full, try again later")
 	}
 
-	return job, nil
+	// snapshot was captured before the queue send — safe to return,
+	// no worker can ever reach this local copy.
+	return &snapshot, nil
 }
 
 // GetJob returns a copy of the job (not the pointer) so callers cannot
@@ -201,10 +208,21 @@ func (s *JobService) Stop() {
 // ── Internal ──────────────────────────────────────────────────────────────────
 
 // worker pulls jobs from the queue and executes them.
+// FIX: added defer recover() so a panic in execute() cannot crash the process.
 // CONCURRENCY NOTE: each worker goroutine owns its own stack — no sharing
 // of local variables. Shared state (s.jobs) is only touched via s.mu.
 func (s *JobService) worker(id int) {
 	defer s.wg.Done()
+
+	// FIX: recover from any panic in execute() so one bad job cannot bring
+	// down the entire worker pool and the process.
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Error("worker recovered from panic",
+				"worker_id", id, "panic", r)
+		}
+	}()
+
 	s.logger.Info("worker started", "worker_id", id)
 
 	for job := range s.queue {
@@ -246,7 +264,8 @@ func (s *JobService) worker(id int) {
 }
 
 // execute simulates staged work. Replace with real business logic.
-// It respects ctx cancellation at every stage.
+// FIX: replaced time.After with time.NewTimer so the timer is always stopped
+// when ctx is cancelled — prevents goroutine/resource leaks under cancellation.
 func (s *JobService) execute(ctx context.Context, job *Job) error {
 	stages := []struct {
 		name     string
@@ -258,10 +277,14 @@ func (s *JobService) execute(ctx context.Context, job *Job) error {
 	}
 
 	for _, stage := range stages {
+		// FIX: NewTimer + Stop() prevents the timer goroutine from leaking
+		// when ctx is cancelled before the timer fires.
+		timer := time.NewTimer(stage.duration)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return ctx.Err()
-		case <-time.After(stage.duration):
+		case <-timer.C:
 			s.logger.Debug("job stage complete",
 				"job_id", job.ID, "stage", stage.name)
 		}

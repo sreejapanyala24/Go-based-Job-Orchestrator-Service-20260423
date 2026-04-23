@@ -69,9 +69,19 @@ func (r *statusRecorder) WriteHeader(code int) {
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 // SubmitJob handles POST /jobs
+// FIX: body is capped at 1 MB via MaxBytesReader to prevent memory exhaustion
+// from large payloads (DoS protection).
 func (h *Handlers) SubmitJob(w http.ResponseWriter, r *http.Request) {
+	// FIX: limit request body to 1 MB; anything larger is a 400.
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
 	var req submitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			h.writeError(w, "request body too large (max 1 MB)", http.StatusRequestEntityTooLarge)
+			return
+		}
 		h.writeError(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
@@ -91,6 +101,7 @@ func (h *Handlers) SubmitJob(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	// job is a copy returned by Submit — safe to encode concurrently.
 	h.writeJSON(w, job, http.StatusCreated)
 }
 
