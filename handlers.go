@@ -9,9 +9,6 @@ import (
 	"time"
 )
 
-// ── Handler dependencies ──────────────────────────────────────────────────────
-// Using an interface makes handlers testable without a real JobService.
-
 type jobServicer interface {
 	Submit(jobType string) (*Job, error)
 	GetJob(id string) (Job, error)
@@ -29,8 +26,6 @@ func NewHandlers(svc jobServicer, logger *slog.Logger) *Handlers {
 	return &Handlers{svc: svc, logger: logger}
 }
 
-// ── Request / response types ──────────────────────────────────────────────────
-
 type submitRequest struct {
 	Type string `json:"type"`
 }
@@ -39,9 +34,6 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
-// ── Middleware ────────────────────────────────────────────────────────────────
-
-// LoggingMiddleware logs method, path, status, and latency for every request.
 func (h *Handlers) LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -66,13 +58,7 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
-// ── Handlers ──────────────────────────────────────────────────────────────────
-
-// SubmitJob handles POST /jobs
-// FIX: body is capped at 1 MB via MaxBytesReader to prevent memory exhaustion
-// from large payloads (DoS protection).
 func (h *Handlers) SubmitJob(w http.ResponseWriter, r *http.Request) {
-	// FIX: limit request body to 1 MB; anything larger is a 400.
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 
 	var req submitRequest
@@ -101,18 +87,15 @@ func (h *Handlers) SubmitJob(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	// job is a copy returned by Submit — safe to encode concurrently.
 	h.writeJSON(w, job, http.StatusCreated)
 }
 
-// ListJobs handles GET /jobs
 func (h *Handlers) ListJobs(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, h.svc.ListJobs(), http.StatusOK)
 }
 
-// GetJob handles GET /jobs/{id}
 func (h *Handlers) GetJob(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id") // requires Go 1.22+
+	id := r.PathValue("id")
 	job, err := h.svc.GetJob(id)
 	if err != nil {
 		if errors.Is(err, ErrJobNotFound) {
@@ -125,7 +108,6 @@ func (h *Handlers) GetJob(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, job, http.StatusOK)
 }
 
-// CancelJob handles DELETE /jobs/{id}
 func (h *Handlers) CancelJob(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	err := h.svc.CancelJob(id)
@@ -143,12 +125,10 @@ func (h *Handlers) CancelJob(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// Health handles GET /health — always 200 if the process is alive
 func (h *Handlers) Health(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, map[string]string{"status": "ok"}, http.StatusOK)
 }
 
-// Ready handles GET /ready — 200 if workers are running, 503 if shutting down
 func (h *Handlers) Ready(w http.ResponseWriter, r *http.Request) {
 	if !h.svc.Ready() {
 		h.writeError(w, "service not ready", http.StatusServiceUnavailable)
@@ -156,8 +136,6 @@ func (h *Handlers) Ready(w http.ResponseWriter, r *http.Request) {
 	}
 	h.writeJSON(w, map[string]string{"status": "ready"}, http.StatusOK)
 }
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 func (h *Handlers) writeJSON(w http.ResponseWriter, v any, status int) {
 	w.Header().Set("Content-Type", "application/json")

@@ -11,22 +11,18 @@ import (
 )
 
 func main() {
-	// ── Logger ─────────────────────────────────────────────────────────────────
-	// slog (stdlib since 1.21) — structured, levelled, zero dependencies.
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 	slog.SetDefault(logger)
 
-	// ── Service ────────────────────────────────────────────────────────────────
 	const (
 		workerCount = 5
 		queueSize   = 100
 	)
 	svc := NewJobService(workerCount, queueSize, logger)
 
-	// ── Routes ─────────────────────────────────────────────────────────────────
-	// Go 1.22 ServeMux supports method+path patterns natively.
 	h := NewHandlers(svc, logger)
 	mux := http.NewServeMux()
 
@@ -46,10 +42,6 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// ── Graceful shutdown ──────────────────────────────────────────────────────
-	// Listen for SIGINT/SIGTERM in a dedicated goroutine.
-	// We use a buffered channel (size 1) so the signal isn't dropped if we're
-	// momentarily busy before calling signal.Notify.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
@@ -57,10 +49,8 @@ func main() {
 		sig := <-sigCh
 		logger.Info("signal received, shutting down", "signal", sig)
 
-		// 1. Stop accepting new jobs.
 		svc.Stop()
 
-		// 2. Stop the HTTP server with a deadline for in-flight requests.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {

@@ -10,10 +10,6 @@ import (
 	"github.com/google/uuid"
 )
 
-// ── Status constants ──────────────────────────────────────────────────────────
-// Using typed string constants (not iota ints) keeps JSON marshaling
-// human-readable without extra MarshalJSON boilerplate.
-
 const (
 	StatusPending   = "pending"
 	StatusRunning   = "running"
@@ -22,16 +18,11 @@ const (
 	StatusCancelled = "cancelled"
 )
 
-// ── Errors ────────────────────────────────────────────────────────────────────
-// Sentinel errors let callers use errors.Is() instead of string matching.
-
 var (
 	ErrJobNotFound     = errors.New("job not found")
 	ErrJobAlreadyDone  = errors.New("job already in terminal state")
 	ErrServiceShutdown = errors.New("service is shutting down")
 )
-
-// ── Data model ────────────────────────────────────────────────────────────────
 
 type Job struct {
 	ID        string    `json:"id"`
@@ -41,25 +32,18 @@ type Job struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// ── Service ───────────────────────────────────────────────────────────────────
-
-// JobService is the single source of truth for all job state.
-// DESIGN NOTE: we pass logger in rather than using a package-level var so
-// tests can inject a no-op logger, and future services can have distinct loggers.
 type JobService struct {
 	mu       sync.RWMutex
 	jobs     map[string]*Job
-	cancels  map[string]context.CancelFunc // per-job cancel
+	cancels  map[string]context.CancelFunc
 	queue    chan *Job
-	wg       sync.WaitGroup // tracks in-flight workers
-	shutdown chan struct{}  // closed on graceful stop
-	once     sync.Once      // ensures shutdown runs once
+	wg       sync.WaitGroup
+	shutdown chan struct{}
+	once     sync.Once
 	logger   *slog.Logger
 	workerN  int
 }
 
-// NewJobService creates the service and starts the worker pool.
-// workerN controls concurrency; queueSize controls backpressure.
 func NewJobService(workerN, queueSize int, logger *slog.Logger) *JobService {
 	s := &JobService{
 		jobs:     make(map[string]*Job),
@@ -76,11 +60,7 @@ func NewJobService(workerN, queueSize int, logger *slog.Logger) *JobService {
 	return s
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
-
-// Submit enqueues a job. Returns ErrServiceShutdown if Stop() was called.
 func (s *JobService) Submit(jobType string) (*Job, error) {
-	// Check shutdown BEFORE acquiring the lock to avoid deadlock patterns.
 	select {
 	case <-s.shutdown:
 		return nil, ErrServiceShutdown
@@ -95,9 +75,6 @@ func (s *JobService) Submit(jobType string) (*Job, error) {
 		UpdatedAt: time.Now().UTC(),
 	}
 
-	// FIX (race): snapshot is taken HERE, while only this goroutine holds the
-	// pointer. After s.queue <- job below, a worker may pick it up and mutate
-	// Status/UpdatedAt concurrently. Any copy taken after that point races.
 	snapshot := *job
 
 	s.mu.Lock()
@@ -106,31 +83,23 @@ func (s *JobService) Submit(jobType string) (*Job, error) {
 
 	s.logger.Info("job submitted", "id", job.ID, "type", job.Type)
 
-	// Non-blocking send: if the queue is full we return an error rather
-	// than blocking the HTTP handler goroutine indefinitely.
 	select {
 	case s.queue <- job:
 	case <-s.shutdown:
-		// Rolled back: remove from store so we don't leak phantom pending jobs.
 		s.mu.Lock()
 		delete(s.jobs, job.ID)
 		s.mu.Unlock()
 		return nil, ErrServiceShutdown
 	default:
-		// Queue full — treat as a 503 at the handler layer.
 		s.mu.Lock()
 		delete(s.jobs, job.ID)
 		s.mu.Unlock()
 		return nil, errors.New("job queue full, try again later")
 	}
 
-	// snapshot was captured before the queue send — safe to return,
-	// no worker can ever reach this local copy.
 	return &snapshot, nil
 }
 
-// GetJob returns a copy of the job (not the pointer) so callers cannot
-// mutate internal state without going through the service.
 func (s *JobService) GetJob(id string) (Job, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -141,7 +110,6 @@ func (s *JobService) GetJob(id string) (Job, error) {
 	return *j, nil
 }
 
-// ListJobs returns copies of all jobs, sorted newest-first.
 func (s *JobService) ListJobs() []Job {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -152,8 +120,6 @@ func (s *JobService) ListJobs() []Job {
 	return out
 }
 
-// CancelJob cancels a pending or running job.
-// Completed/failed jobs cannot be cancelled (idempotent no-op for cancelled).
 func (s *JobService) CancelJob(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -167,10 +133,9 @@ func (s *JobService) CancelJob(id string) error {
 	case StatusCompleted, StatusFailed:
 		return ErrJobAlreadyDone
 	case StatusCancelled:
-		return nil // idempotent
+		return nil
 	}
 
-	// Signal the running goroutine (if any) to stop.
 	if cancel, ok := s.cancels[id]; ok {
 		cancel()
 		delete(s.cancels, id)
@@ -181,8 +146,6 @@ func (s *JobService) CancelJob(id string) error {
 	return nil
 }
 
-// Ready returns true once the worker pool is running.
-// Used by the /ready probe.
 func (s *JobService) Ready() bool {
 	select {
 	case <-s.shutdown:
@@ -192,8 +155,6 @@ func (s *JobService) Ready() bool {
 	}
 }
 
-// Stop drains the queue and waits for in-flight workers to finish.
-// Safe to call multiple times (sync.Once).
 func (s *JobService) Stop() {
 	s.once.Do(func() {
 		s.logger.Info("service shutting down")
@@ -205,17 +166,8 @@ func (s *JobService) Stop() {
 	})
 }
 
-// ── Internal ──────────────────────────────────────────────────────────────────
-
-// worker pulls jobs from the queue and executes them.
-// FIX: added defer recover() so a panic in execute() cannot crash the process.
-// CONCURRENCY NOTE: each worker goroutine owns its own stack — no sharing
-// of local variables. Shared state (s.jobs) is only touched via s.mu.
 func (s *JobService) worker(id int) {
 	defer s.wg.Done()
-
-	// FIX: recover from any panic in execute() so one bad job cannot bring
-	// down the entire worker pool and the process.
 	defer func() {
 		if r := recover(); r != nil {
 			s.logger.Error("worker recovered from panic",
@@ -226,11 +178,9 @@ func (s *JobService) worker(id int) {
 	s.logger.Info("worker started", "worker_id", id)
 
 	for job := range s.queue {
-		// Create a per-job context so CancelJob can abort execution.
 		ctx, cancel := context.WithCancel(context.Background())
 
 		s.mu.Lock()
-		// Job might have been cancelled while sitting in the queue.
 		if job.Status == StatusCancelled {
 			cancel()
 			s.mu.Unlock()
@@ -245,7 +195,6 @@ func (s *JobService) worker(id int) {
 
 		s.mu.Lock()
 		delete(s.cancels, job.ID)
-		// Don't overwrite Cancelled status set by CancelJob.
 		if job.Status != StatusCancelled {
 			if err != nil {
 				s.updateStatus(job, StatusFailed)
@@ -257,15 +206,12 @@ func (s *JobService) worker(id int) {
 		}
 		s.mu.Unlock()
 
-		cancel() // always release the cancel func
+		cancel()
 	}
 
 	s.logger.Info("worker stopped", "worker_id", id)
 }
 
-// execute simulates staged work. Replace with real business logic.
-// FIX: replaced time.After with time.NewTimer so the timer is always stopped
-// when ctx is cancelled — prevents goroutine/resource leaks under cancellation.
 func (s *JobService) execute(ctx context.Context, job *Job) error {
 	stages := []struct {
 		name     string
@@ -277,8 +223,6 @@ func (s *JobService) execute(ctx context.Context, job *Job) error {
 	}
 
 	for _, stage := range stages {
-		// FIX: NewTimer + Stop() prevents the timer goroutine from leaking
-		// when ctx is cancelled before the timer fires.
 		timer := time.NewTimer(stage.duration)
 		select {
 		case <-ctx.Done():
@@ -292,8 +236,6 @@ func (s *JobService) execute(ctx context.Context, job *Job) error {
 	return nil
 }
 
-// updateStatus sets job status and bumps UpdatedAt.
-// MUST be called with s.mu held (write lock).
 func (s *JobService) updateStatus(j *Job, status string) {
 	j.Status = status
 	j.UpdatedAt = time.Now().UTC()
