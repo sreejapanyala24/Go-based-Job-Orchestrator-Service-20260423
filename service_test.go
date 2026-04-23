@@ -8,7 +8,6 @@ import (
 	"time"
 )
 
-// testLogger returns a no-op slog logger so tests aren't noisy.
 func testLogger(t *testing.T) *slog.Logger {
 	t.Helper()
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -17,11 +16,9 @@ func testLogger(t *testing.T) *slog.Logger {
 func newTestService(t *testing.T) *JobService {
 	t.Helper()
 	svc := NewJobService(3, 50, testLogger(t))
-	t.Cleanup(svc.Stop) // always stops the service when the test ends
+	t.Cleanup(svc.Stop)
 	return svc
 }
-
-// ── 1. Job creation ───────────────────────────────────────────────────────────
 
 func TestSubmit_StoresJob(t *testing.T) {
 	svc := newTestService(t)
@@ -40,7 +37,6 @@ func TestSubmit_StoresJob(t *testing.T) {
 		t.Error("expected non-zero CreatedAt")
 	}
 
-	// Verify it's actually in the store.
 	stored, err := svc.GetJob(job.ID)
 	if err != nil {
 		t.Fatalf("GetJob failed: %v", err)
@@ -50,8 +46,6 @@ func TestSubmit_StoresJob(t *testing.T) {
 	}
 }
 
-// ── 2. Job lifecycle ──────────────────────────────────────────────────────────
-
 func TestJobLifecycle_PendingToCompleted(t *testing.T) {
 	svc := newTestService(t)
 
@@ -60,13 +54,10 @@ func TestJobLifecycle_PendingToCompleted(t *testing.T) {
 		t.Fatalf("submit failed: %v", err)
 	}
 
-	// The job should start as pending or transition quickly.
-	// We poll for up to 5s — using a ticker avoids a hardcoded sleep.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		j, _ := svc.GetJob(job.ID)
 		if j.Status == StatusCompleted {
-			// Verify UpdatedAt was bumped.
 			if !j.UpdatedAt.After(j.CreatedAt) {
 				t.Error("UpdatedAt should be after CreatedAt on completion")
 			}
@@ -85,8 +76,6 @@ func TestJobLifecycle_RunningTransition(t *testing.T) {
 		t.Fatalf("submit failed: %v", err)
 	}
 
-	// Catch the running state. This might be flaky if the machine is extremely
-	// fast; the 300ms initial stage makes it catchable in normal CI.
 	deadline := time.Now().Add(3 * time.Second)
 	sawRunning := false
 	for time.Now().Before(deadline) {
@@ -96,18 +85,15 @@ func TestJobLifecycle_RunningTransition(t *testing.T) {
 			break
 		}
 		if j.Status == StatusCompleted {
-			break // completed before we could catch running — still valid
+			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	// Note: not a hard failure if we miss running — it's a race by design.
-	// We just log it.
+
 	if !sawRunning {
 		t.Log("note: did not observe running state (job completed too fast)")
 	}
 }
-
-// ── 3. Concurrency — no data races, all jobs complete ────────────────────────
 
 func TestConcurrent_AllJobsComplete(t *testing.T) {
 	svc := newTestService(t)
@@ -119,7 +105,6 @@ func TestConcurrent_AllJobsComplete(t *testing.T) {
 		ids []string
 	)
 
-	// Submit all jobs concurrently.
 	for i := 0; i < jobCount; i++ {
 		wg.Add(1)
 		go func() {
@@ -136,7 +121,6 @@ func TestConcurrent_AllJobsComplete(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Wait for all to finish (up to 15s).
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		doneCount := 0
@@ -154,8 +138,6 @@ func TestConcurrent_AllJobsComplete(t *testing.T) {
 	t.Fatalf("not all jobs completed within deadline; submitted=%d", len(ids))
 }
 
-// ── 4. Cancellation ───────────────────────────────────────────────────────────
-
 func TestCancel_RunningJob(t *testing.T) {
 	svc := newTestService(t)
 
@@ -164,7 +146,6 @@ func TestCancel_RunningJob(t *testing.T) {
 		t.Fatalf("submit failed: %v", err)
 	}
 
-	// Wait until the job is running before cancelling.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		j, _ := svc.GetJob(job.ID)
@@ -178,8 +159,7 @@ func TestCancel_RunningJob(t *testing.T) {
 		t.Fatalf("cancel failed: %v", err)
 	}
 
-	// Confirm the final status is cancelled, not completed.
-	time.Sleep(500 * time.Millisecond) // let the goroutine observe ctx.Done()
+	time.Sleep(500 * time.Millisecond)
 	j, _ := svc.GetJob(job.ID)
 	if j.Status != StatusCancelled {
 		t.Errorf("want status %q, got %q", StatusCancelled, j.Status)
@@ -187,11 +167,9 @@ func TestCancel_RunningJob(t *testing.T) {
 }
 
 func TestCancel_PendingJob(t *testing.T) {
-	// Fill the queue so our job stays pending.
 	svc := NewJobService(1, 100, testLogger(t)) // 1 worker
 	t.Cleanup(svc.Stop)
 
-	// Flood the queue to ensure next job stays pending.
 	for i := 0; i < 10; i++ {
 		svc.Submit("filler")
 	}
@@ -210,8 +188,6 @@ func TestCancel_PendingJob(t *testing.T) {
 		t.Errorf("want %q, got %q", StatusCancelled, j.Status)
 	}
 }
-
-// ── 5. Edge cases ─────────────────────────────────────────────────────────────
 
 func TestGetJob_NotFound(t *testing.T) {
 	svc := newTestService(t)
