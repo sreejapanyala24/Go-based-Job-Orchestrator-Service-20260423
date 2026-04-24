@@ -20,14 +20,14 @@ The focus of this project is **concurrency correctness**, **infrastructure readi
 
 ## Project Structure
 
-**| File | Purpose |**
-
-| **main.go** | Server initialization, HTTP routing, signal handling, graceful shutdown |
-| **handlers.go** | HTTP request handlers, input validation, JSON response formatting |
-| **service.go** | Job queue management, worker goroutines, concurrent state management, job execution logic |
-| **service_test.go** | Unit tests for job lifecycle, concurrent submissions, cancellation, and edge cases |
-| **handlers_test.go** | HTTP endpoint tests and response validation |
-| **go.mod** | Go module definition and dependencies |
+| File | Purpose |
+|---|---|
+| `main.go` | Server initialization, HTTP routing, signal handling, graceful shutdown |
+| `handlers.go` | HTTP request handlers, input validation, JSON response formatting |
+| `service.go` | Job queue management, worker goroutines, concurrent state management, job execution logic |
+| `service_test.go` | Unit tests for job lifecycle, concurrent submissions, cancellation, and edge cases |
+| `handlers_test.go` | HTTP endpoint tests and response validation |
+| `go.mod` | Go module definition and dependencies |
 
 ---
 
@@ -365,79 +365,3 @@ go test -race -v ./...
 
 ---
 
-## Configuration
-
-Environment variables and defaults:
-
-```bash
-# Port the service listens on (default: 8000)
-export PORT=8000
-
-# Number of worker goroutines (default: 10)
-export WORKERS=10
-
-# Job queue capacity (default: 100)
-export QUEUE_SIZE=100
-
-# Job execution timeout in seconds (default: 30)
-export JOB_TIMEOUT=30
-
-# Graceful shutdown timeout in seconds (default: 15)
-export SHUTDOWN_TIMEOUT=15
-```
-
----
-
-## Performance Characteristics
-
-- **Throughput** — Limited by worker count and job complexity
-- **Latency** — Job submission is O(1); job execution is job-dependent
-- **Memory** — Proportional to queue size + number of in-flight jobs
-- **Concurrency Safety** — Validated with `go test -race` on every build
-
----
-
-## Troubleshooting
-
-### Service Won't Start
-
-Check port availability:
-```bash
-lsof -i :8000
-```
-
-Or bind to a different port:
-```bash
-PORT=8001 ./taskflow-infra
-```
-
-### High Memory Usage
-
-Reduce queue size or worker count:
-```bash
-QUEUE_SIZE=50 WORKERS=5 ./taskflow-infra
-```
-
-### Jobs Not Processing
-
-Verify workers are running:
-```bash
-curl http://localhost:8000/ready
-```
-
-Check service logs for errors.
-
-### Race Detector Warnings
-
-Run tests to identify data races:
-```bash
-go test -race -v ./...
-```
-
-Fix the issue before deploying to production.
-
----
-
-## License
-
-[Add your license here]
