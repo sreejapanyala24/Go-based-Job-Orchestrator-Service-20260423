@@ -239,7 +239,7 @@ func (s *Service) execute(ctx context.Context) error {
 		case <-ctx.Done():
 			timer.Stop()
 			return ctx.Err()
-		case <-time.After(stageDuration):
+		case <-timer.C:
 		}
 	}
 	return nil
