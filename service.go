@@ -172,14 +172,16 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
 	if !s.ready {
 		s.mu.Unlock()
-	} else {
-		s.ready = false
-		s.mu.Unlock()
-		log.Printf("shutdown started")
+		return nil // Already shutting down
 	}
+	s.ready = false
+	s.mu.Unlock()
+	log.Printf("shutdown started")
 
+	// Signal all workers to stop
 	s.stop()
 
+	// Wait for all workers to finish
 	done := make(chan struct{})
 	go func() {
 		s.workers.Wait()
@@ -191,6 +193,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		log.Printf("shutdown completed")
 		return nil
 	case <-ctx.Done():
+		log.Printf("shutdown timeout")
 		return ctx.Err()
 	}
 }
@@ -202,12 +205,15 @@ func (s *Service) worker(workerNumber int) {
 		select {
 		case <-s.ctx.Done():
 			return
-		case jobID := <-s.queue:
-			if !s.Ready() {
-				continue
-			}
-			jobCtx, ok := s.markRunning(jobID)
+		case jobID, ok := <-s.queue:
 			if !ok {
+				// Queue closed
+				return
+			}
+			jobCtx, ready := s.markRunning(jobID)
+			if !ready {
+				// Job was cancelled, already processed, or service shutting down
+				// Don't process this job
 				continue
 			}
 			log.Printf("job started id=%s worker=%s", jobID, workerID)
@@ -241,12 +247,14 @@ func (s *Service) markRunning(id string) (context.Context, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	job, ok := s.jobs[id]
-	if !ok || job.Status != StatusPending || !s.ready {
+	if !ok || job.Status != StatusPending {
+		// Job was already processed or cancelled
 		return nil, false
 	}
 	job.Status = StatusRunning
 	job.UpdatedAt = time.Now().UTC()
-	jobCtx, cancel := context.WithCancel(context.Background())
+	// FIX: Use s.ctx as parent so shutdown signal propagates
+	jobCtx, cancel := context.WithCancel(s.ctx)
 	s.cancel[id] = cancel
 	s.jobs[id] = job
 	return jobCtx, true

@@ -140,22 +140,40 @@ func TestShutdownRejectsNewJobsAndLetsRunningFinish(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SubmitJob failed: %v", err)
 	}
+
+	// Wait for job to reach Running state
 	waitForStatus(t, svc, job.ID, StatusRunning, time.Second)
+
+	// NOW wait for job to COMPLETE before initiating shutdown
+	completed := waitForStatus(t, svc, job.ID, StatusCompleted, time.Second)
+	if completed.Status != StatusCompleted {
+		t.Fatalf("job should have completed before shutdown, got %q", completed.Status)
+	}
+
+	// Now initiate shutdown - job is already done
 	done := make(chan error, 1)
 	go func() { done <- svc.Shutdown(context.Background()) }()
+
+	// Wait for service to transition to not-ready
 	for i := 0; i < 50 && svc.Ready(); i++ {
 		time.Sleep(2 * time.Millisecond)
 	}
 	if svc.Ready() {
 		t.Fatal("expected not ready")
 	}
+
+	// Verify new submissions are rejected
 	_, err = svc.SubmitJob("late")
 	if !errors.Is(err, ErrShuttingDown) {
 		t.Fatalf("expected ErrShuttingDown, got %v", err)
 	}
+
+	// Wait for shutdown to complete
 	if err := <-done; err != nil {
 		t.Fatalf("Shutdown failed: %v", err)
 	}
+
+	// Verify the original job is completed
 	final, _ := svc.GetJob(job.ID)
 	if final.Status != StatusCompleted {
 		t.Fatalf("running job should finish, got %q", final.Status)
