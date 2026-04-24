@@ -2,139 +2,115 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
-	"log"
 	"net/http"
-	"strings"
 )
 
 type Handler struct {
 	svc *Service
 }
 
-type submitJobRequest struct {
-	Type string `json:"type"`
+func NewHandler(s *Service) *Handler {
+	return &Handler{svc: s}
 }
 
-type errorResponse struct {
-	Error string `json:"error"`
-}
-
-func NewHandler(svc *Service) *Handler {
-	return &Handler{svc: svc}
-}
-
-func (h *Handler) Routes() http.Handler {
+func (h *Handler) routes() http.Handler {
 	mux := http.NewServeMux()
+
 	mux.HandleFunc("/health", h.health)
 	mux.HandleFunc("/ready", h.ready)
+
 	mux.HandleFunc("/jobs", h.jobs)
 	mux.HandleFunc("/jobs/", h.jobByID)
-	return loggingMiddleware(mux)
+
+	return mux
 }
 
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) ready(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
 	if !h.svc.Ready() {
-		writeError(w, http.StatusServiceUnavailable, "not ready")
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) jobs(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
-		h.submitJob(w, r)
+		h.submit(w, r)
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, h.svc.ListJobs())
+		h.list(w, r)
 	default:
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
-}
-
-func (h *Handler) submitJob(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	defer r.Body.Close()
-	var req submitJobRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-	req.Type = strings.TrimSpace(req.Type)
-	job, err := h.svc.SubmitJob(req.Type)
-	if err != nil {
-		status := http.StatusInternalServerError
-		switch {
-		case errors.Is(err, ErrInvalidJobType):
-			status = http.StatusBadRequest
-		case errors.Is(err, ErrShuttingDown), errors.Is(err, ErrQueueFull):
-			status = http.StatusServiceUnavailable
-		}
-		writeError(w, status, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusCreated, job)
 }
 
 func (h *Handler) jobByID(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/jobs/")
-	id = strings.TrimSpace(id)
-	if id == "" || strings.Contains(id, "/") {
-		writeError(w, http.StatusNotFound, "job not found")
+	id := r.URL.Path[len("/jobs/"):]
+	switch r.Method {
+	case http.MethodGet:
+		h.get(w, r, id)
+	case http.MethodDelete:
+		h.cancel(w, r, id)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) submit(w http.ResponseWriter, r *http.Request) {
+	if !h.svc.Ready() {
+		http.Error(w, "service shutting down", http.StatusServiceUnavailable)
 		return
 	}
 
-	switch r.Method {
-	case http.MethodGet:
-		job, err := h.svc.GetJob(id)
-		if err != nil {
-			writeError(w, http.StatusNotFound, err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, job)
-	case http.MethodDelete:
-		job, err := h.svc.CancelJob(id)
-		if err != nil {
-			if errors.Is(err, ErrNotFound) {
-				writeError(w, http.StatusNotFound, err.Error())
-				return
-			}
-			writeError(w, http.StatusConflict, err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, job)
-	default:
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	defer r.Body.Close()
+
+	var req struct {
+		Type string `json:"type"`
 	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Type == "" {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	job, err := h.svc.Submit(req.Type)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, job)
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, h.svc.List())
+}
+
+func (h *Handler) get(w http.ResponseWriter, r *http.Request, id string) {
+	job, ok := h.svc.Get(id)
+	if !ok {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, job)
+}
+
+func (h *Handler) cancel(w http.ResponseWriter, r *http.Request, id string) {
+	err := h.svc.Cancel(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("response encode error: %v", err)
-	}
-}
-
-func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, errorResponse{Error: message})
-}
-
-func loggingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("request method=%s path=%s remote=%s", r.Method, r.URL.Path, r.RemoteAddr)
-		next.ServeHTTP(w, r)
-	})
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(v)
 }

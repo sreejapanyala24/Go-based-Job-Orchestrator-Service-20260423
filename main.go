@@ -11,61 +11,65 @@ import (
 	"time"
 )
 
-func envOrInt(key string, fallback int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
-	}
-	return fallback
-}
-
 func main() {
-	workers := envOrInt("WORKERS", 4)
-	queueSize := envOrInt("QUEUE_SIZE", 100)
-	jobDuration := time.Duration(envOrInt("JOB_DURATION_MS", 2000)) * time.Millisecond
-	addr := os.Getenv("ADDR")
-	if addr == "" {
-		addr = ":8000"
-	}
+	port := getEnv("PORT", "8000")
+	workerCount := getEnvInt("WORKERS", 4)
 
-	svc := NewService(workers, queueSize, jobDuration)
-	h := NewHandler(svc)
+	svc := NewService(workerCount)
+	svc.Start()
+
+	handler := NewHandler(svc)
 
 	server := &http.Server{
-		Addr:              addr,
-		Handler:           h.Routes(),
+		Addr:              ":" + port,
+		Handler:           handler.routes(),
+		ReadTimeout:       5 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
-	serverErr := make(chan error, 1)
 	go func() {
-		log.Printf("server listening addr=%s", server.Addr)
-		serverErr <- server.ListenAndServe()
-	}()
-
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-
-	select {
-	case s := <-sig:
-		log.Printf("signal received signal=%s", s)
-	case err := <-serverErr:
-		if err != nil && err != http.ErrServerClosed {
+		log.Printf("server started on %s", port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("server error: %v", err)
 		}
-	}
+	}()
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
 
-	if err := svc.Shutdown(shutdownCtx); err != nil {
-		log.Printf("service shutdown error: %v", err)
+	log.Println("shutdown initiated")
+
+	// 1. stop HTTP intake first
+	httpCtx, cancelHTTP := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelHTTP()
+	_ = server.Shutdown(httpCtx)
+
+	// 2. then shutdown service
+	svcCtx, cancelSvc := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelSvc()
+	svc.Shutdown(svcCtx)
+
+	log.Println("shutdown complete")
+}
+
+func getEnv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("http shutdown error: %v", err)
+	return def
+}
+
+func getEnvInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
 	}
+	i, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return i
 }
