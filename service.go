@@ -234,8 +234,10 @@ func (s *Service) execute(ctx context.Context) error {
 		stageDuration = time.Millisecond
 	}
 	for i := 0; i < stages; i++ {
+		timer := time.NewTimer(stageDuration)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return ctx.Err()
 		case <-time.After(stageDuration):
 		}
