@@ -65,6 +65,7 @@ func (h *Handler) jobs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) submitJob(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	defer r.Body.Close()
 	var req submitJobRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

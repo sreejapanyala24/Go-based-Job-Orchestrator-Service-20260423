@@ -6,18 +6,39 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 )
 
+func envOrInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return fallback
+}
+
 func main() {
-	svc := NewService(4, 100, 2*time.Second)
+	workers := envOrInt("WORKERS", 4)
+	queueSize := envOrInt("QUEUE_SIZE", 100)
+	jobDuration := time.Duration(envOrInt("JOB_DURATION_MS", 2000)) * time.Millisecond
+	addr := os.Getenv("ADDR")
+	if addr == "" {
+		addr = ":8000"
+	}
+
+	svc := NewService(workers, queueSize, jobDuration)
 	h := NewHandler(svc)
 
 	server := &http.Server{
-		Addr:              ":8000",
+		Addr:              addr,
 		Handler:           h.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	serverErr := make(chan error, 1)
