@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log/slog"
+	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -11,65 +11,40 @@ import (
 )
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-	slog.SetDefault(logger)
+	svc := NewService(4, 100, 2*time.Second)
+	h := NewHandler(svc)
 
-	const (
-		workerCount = 5
-		queueSize   = 100
-	)
-	svc := NewJobService(workerCount, queueSize, logger)
-
-	h := NewHandlers(svc, logger)
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("POST /jobs", h.SubmitJob)
-	mux.HandleFunc("GET /jobs", h.ListJobs)
-	mux.HandleFunc("GET /jobs/{id}", h.GetJob)
-	mux.HandleFunc("DELETE /jobs/{id}", h.CancelJob)
-	mux.HandleFunc("GET /health", h.Health)
-	mux.HandleFunc("GET /ready", h.Ready)
-
-	addr := envOr("ADDR", ":8000")
-	srv := &http.Server{
-		Addr:         addr,
-		Handler:      h.LoggingMiddleware(mux),
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+	server := &http.Server{
+		Addr:              ":8000",
+		Handler:           h.Routes(),
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
+	serverErr := make(chan error, 1)
 	go func() {
-		sig := <-sigCh
-		logger.Info("signal received, shutting down", "signal", sig)
-
-		httpCtx, httpCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer httpCancel()
-		if err := srv.Shutdown(httpCtx); err != nil {
-			logger.Error("HTTP server shutdown error", "error", err)
-		}
-
-		if err := svc.GracefulStop(20 * time.Second); err != nil {
-			logger.Warn("job service did not drain cleanly", "error", err)
-		}
+		log.Printf("server listening addr=%s", server.Addr)
+		serverErr <- server.ListenAndServe()
 	}()
 
-	logger.Info("server starting", "addr", addr, "workers", workerCount)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		logger.Error("server error", "error", err)
-		os.Exit(1)
-	}
-	logger.Info("server stopped")
-}
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+	select {
+	case s := <-sig:
+		log.Printf("signal received signal=%s", s)
+	case err := <-serverErr:
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
+		}
 	}
-	return fallback
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := svc.Shutdown(shutdownCtx); err != nil {
+		log.Printf("service shutdown error: %v", err)
+	}
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("http shutdown error: %v", err)
+	}
 }

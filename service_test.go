@@ -1,237 +1,163 @@
 package main
 
 import (
-	"io"
-	"log/slog"
+	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 )
 
-func testLogger(t *testing.T) *slog.Logger {
-	t.Helper()
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+func newTestService(workers int, duration time.Duration) *Service {
+	return NewService(workers, 1000, duration)
 }
 
-func newTestService(t *testing.T) *JobService {
+func waitForStatus(t *testing.T, svc *Service, id string, status string, timeout time.Duration) Job {
 	t.Helper()
-	svc := NewJobService(3, 50, testLogger(t))
-	t.Cleanup(svc.Stop)
-	return svc
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		job, err := svc.GetJob(id)
+		if err != nil {
+			t.Fatalf("GetJob failed: %v", err)
+		}
+		if job.Status == status {
+			return job
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	job, _ := svc.GetJob(id)
+	t.Fatalf("timed out waiting for status %q, got %q", status, job.Status)
+	return Job{}
 }
 
-func TestSubmit_StoresJob(t *testing.T) {
-	svc := newTestService(t)
-
-	job, err := svc.Submit("build")
+func TestJobCreation(t *testing.T) {
+	svc := newTestService(1, 100*time.Millisecond)
+	defer svc.Shutdown(context.Background())
+	job, err := svc.SubmitJob("backup")
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("SubmitJob failed: %v", err)
 	}
-	if job.ID == "" {
-		t.Error("expected non-empty job ID")
+	if job.ID == "" || job.Type != "backup" || job.Status != StatusPending {
+		t.Fatalf("bad job: %+v", job)
 	}
-	if job.Status != StatusPending {
-		t.Errorf("want status %q, got %q", StatusPending, job.Status)
+	if job.CreatedAt.IsZero() || job.UpdatedAt.IsZero() {
+		t.Fatal("expected timestamps")
 	}
-	if job.CreatedAt.IsZero() {
-		t.Error("expected non-zero CreatedAt")
-	}
-
 	stored, err := svc.GetJob(job.ID)
-	if err != nil {
-		t.Fatalf("GetJob failed: %v", err)
-	}
-	if stored.ID != job.ID {
-		t.Errorf("stored ID mismatch: want %q, got %q", job.ID, stored.ID)
+	if err != nil || stored.ID != job.ID {
+		t.Fatalf("expected stored job, got %+v err=%v", stored, err)
 	}
 }
 
-func TestJobLifecycle_PendingToCompleted(t *testing.T) {
-	svc := newTestService(t)
-
-	job, err := svc.Submit("deploy")
+func TestJobLifecycle(t *testing.T) {
+	svc := newTestService(1, 80*time.Millisecond)
+	defer svc.Shutdown(context.Background())
+	job, err := svc.SubmitJob("deploy")
 	if err != nil {
-		t.Fatalf("submit failed: %v", err)
+		t.Fatalf("SubmitJob failed: %v", err)
 	}
-
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		j, _ := svc.GetJob(job.ID)
-		if j.Status == StatusCompleted {
-			if !j.UpdatedAt.After(j.CreatedAt) {
-				t.Error("UpdatedAt should be after CreatedAt on completion")
-			}
-			return
-		}
-		time.Sleep(100 * time.Millisecond)
+	created := job.UpdatedAt
+	running := waitForStatus(t, svc, job.ID, StatusRunning, time.Second)
+	if !running.UpdatedAt.After(created) {
+		t.Fatal("UpdatedAt did not advance on running")
 	}
-	t.Fatal("job did not reach 'completed' within deadline")
-}
-
-func TestJobLifecycle_RunningTransition(t *testing.T) {
-	svc := newTestService(t)
-
-	job, err := svc.Submit("test-type")
-	if err != nil {
-		t.Fatalf("submit failed: %v", err)
-	}
-
-	deadline := time.Now().Add(3 * time.Second)
-	sawRunning := false
-	for time.Now().Before(deadline) {
-		j, _ := svc.GetJob(job.ID)
-		if j.Status == StatusRunning {
-			sawRunning = true
-			break
-		}
-		if j.Status == StatusCompleted {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	if !sawRunning {
-		t.Log("note: did not observe running state (job completed too fast)")
+	completed := waitForStatus(t, svc, job.ID, StatusCompleted, time.Second)
+	if !completed.UpdatedAt.After(running.UpdatedAt) {
+		t.Fatal("UpdatedAt did not advance on completed")
 	}
 }
 
-func TestConcurrent_AllJobsComplete(t *testing.T) {
-	svc := newTestService(t)
-	const jobCount = 20
-
-	var (
-		wg  sync.WaitGroup
-		mu  sync.Mutex
-		ids []string
-	)
-
-	for i := 0; i < jobCount; i++ {
+func TestConcurrentSubmissionsCompleteWithoutRace(t *testing.T) {
+	svc := newTestService(8, 20*time.Millisecond)
+	defer svc.Shutdown(context.Background())
+	const count = 100
+	ids := make(chan string, count)
+	var wg sync.WaitGroup
+	for i := 0; i < count; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			job, err := svc.Submit("concurrent-test")
+			job, err := svc.SubmitJob("task")
 			if err != nil {
-				t.Errorf("submit error: %v", err)
+				t.Errorf("SubmitJob failed: %v", err)
 				return
 			}
-			mu.Lock()
-			ids = append(ids, job.ID)
-			mu.Unlock()
+			ids <- job.ID
 		}()
 	}
 	wg.Wait()
-
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		doneCount := 0
-		for _, id := range ids {
-			j, _ := svc.GetJob(id)
-			if j.Status == StatusCompleted || j.Status == StatusFailed {
-				doneCount++
-			}
-		}
-		if doneCount == len(ids) {
-			return
-		}
-		time.Sleep(200 * time.Millisecond)
+	close(ids)
+	for id := range ids {
+		waitForStatus(t, svc, id, StatusCompleted, 3*time.Second)
 	}
-	t.Fatalf("not all jobs completed within deadline; submitted=%d", len(ids))
+	if got := len(svc.ListJobs()); got != count {
+		t.Fatalf("expected %d jobs, got %d", count, got)
+	}
 }
 
-func TestCancel_RunningJob(t *testing.T) {
-	svc := newTestService(t)
-
-	job, err := svc.Submit("long-job")
+func TestCancelRunningJobDoesNotComplete(t *testing.T) {
+	svc := newTestService(1, 300*time.Millisecond)
+	defer svc.Shutdown(context.Background())
+	job, err := svc.SubmitJob("long-running")
 	if err != nil {
-		t.Fatalf("submit failed: %v", err)
+		t.Fatalf("SubmitJob failed: %v", err)
 	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		j, _ := svc.GetJob(job.ID)
-		if j.Status == StatusRunning {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+	waitForStatus(t, svc, job.ID, StatusRunning, time.Second)
+	cancelled, err := svc.CancelJob(job.ID)
+	if err != nil || cancelled.Status != StatusCancelled {
+		t.Fatalf("cancel failed: %+v err=%v", cancelled, err)
 	}
-
-	if err := svc.CancelJob(job.ID); err != nil {
-		t.Fatalf("cancel failed: %v", err)
-	}
-
-	time.Sleep(500 * time.Millisecond)
-	j, _ := svc.GetJob(job.ID)
-	if j.Status != StatusCancelled {
-		t.Errorf("want status %q, got %q", StatusCancelled, j.Status)
+	time.Sleep(400 * time.Millisecond)
+	final, _ := svc.GetJob(job.ID)
+	if final.Status != StatusCancelled {
+		t.Fatalf("cancelled job completed: %q", final.Status)
 	}
 }
 
-func TestCancel_PendingJob(t *testing.T) {
-	svc := NewJobService(1, 100, testLogger(t)) // 1 worker
-	t.Cleanup(svc.Stop)
-
-	for i := 0; i < 10; i++ {
-		svc.Submit("filler")
+func TestNonExistentJobLookup(t *testing.T) {
+	svc := newTestService(1, 50*time.Millisecond)
+	defer svc.Shutdown(context.Background())
+	_, err := svc.GetJob("missing")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
+}
 
-	job, err := svc.Submit("to-cancel")
+func TestCancelCompletedJob(t *testing.T) {
+	svc := newTestService(1, 20*time.Millisecond)
+	defer svc.Shutdown(context.Background())
+	job, _ := svc.SubmitJob("quick")
+	waitForStatus(t, svc, job.ID, StatusCompleted, time.Second)
+	_, err := svc.CancelJob(job.ID)
+	if !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("expected ErrInvalidState, got %v", err)
+	}
+}
+
+func TestShutdownRejectsNewJobsAndLetsRunningFinish(t *testing.T) {
+	svc := newTestService(1, 120*time.Millisecond)
+	job, err := svc.SubmitJob("drain")
 	if err != nil {
-		t.Fatalf("submit failed: %v", err)
+		t.Fatalf("SubmitJob failed: %v", err)
 	}
-
-	if err := svc.CancelJob(job.ID); err != nil {
-		t.Fatalf("cancel failed: %v", err)
+	waitForStatus(t, svc, job.ID, StatusRunning, time.Second)
+	done := make(chan error, 1)
+	go func() { done <- svc.Shutdown(context.Background()) }()
+	for i := 0; i < 50 && svc.Ready(); i++ {
+		time.Sleep(2 * time.Millisecond)
 	}
-
-	j, _ := svc.GetJob(job.ID)
-	if j.Status != StatusCancelled {
-		t.Errorf("want %q, got %q", StatusCancelled, j.Status)
+	if svc.Ready() {
+		t.Fatal("expected not ready")
 	}
-}
-
-func TestGetJob_NotFound(t *testing.T) {
-	svc := newTestService(t)
-	_, err := svc.GetJob("nonexistent-id")
-	if err != ErrJobNotFound {
-		t.Errorf("want ErrJobNotFound, got %v", err)
+	_, err = svc.SubmitJob("late")
+	if !errors.Is(err, ErrShuttingDown) {
+		t.Fatalf("expected ErrShuttingDown, got %v", err)
 	}
-}
-
-func TestCancelJob_NotFound(t *testing.T) {
-	svc := newTestService(t)
-	err := svc.CancelJob("nonexistent-id")
-	if err != ErrJobNotFound {
-		t.Errorf("want ErrJobNotFound, got %v", err)
+	if err := <-done; err != nil {
+		t.Fatalf("Shutdown failed: %v", err)
 	}
-}
-
-func TestCancelJob_AlreadyCompleted(t *testing.T) {
-	svc := newTestService(t)
-
-	job, _ := svc.Submit("quick")
-
-	// Wait for completion.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		j, _ := svc.GetJob(job.ID)
-		if j.Status == StatusCompleted {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	err := svc.CancelJob(job.ID)
-	if err != ErrJobAlreadyDone {
-		t.Errorf("want ErrJobAlreadyDone, got %v", err)
-	}
-}
-
-func TestSubmit_AfterShutdown(t *testing.T) {
-	svc := newTestService(t)
-	svc.Stop()
-
-	_, err := svc.Submit("should-fail")
-	if err != ErrServiceShutdown {
-		t.Errorf("want ErrServiceShutdown, got %v", err)
+	final, _ := svc.GetJob(job.ID)
+	if final.Status != StatusCompleted {
+		t.Fatalf("running job should finish, got %q", final.Status)
 	}
 }

@@ -3,12 +3,12 @@ package main
 import (
 	"context"
 	"errors"
-	"log/slog"
-	"slices"
+	"fmt"
+	"log"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 const (
@@ -20,9 +20,11 @@ const (
 )
 
 var (
-	ErrJobNotFound     = errors.New("job not found")
-	ErrJobAlreadyDone  = errors.New("job already in terminal state")
-	ErrServiceShutdown = errors.New("service is shutting down")
+	ErrNotFound       = errors.New("job not found")
+	ErrInvalidJobType = errors.New("job type is required")
+	ErrShuttingDown   = errors.New("service is shutting down")
+	ErrInvalidState   = errors.New("invalid job state transition")
+	ErrQueueFull      = errors.New("job queue is full")
 )
 
 type Job struct {
@@ -33,240 +35,263 @@ type Job struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-type JobService struct {
+type Service struct {
 	mu       sync.RWMutex
-	jobs     map[string]*Job
-	cancels  map[string]context.CancelFunc
-	queue    chan *Job
-	wg       sync.WaitGroup
-	shutdown chan struct{}
-	once     sync.Once
-	logger   *slog.Logger
-	workerN  int
+	jobs     map[string]Job
+	cancel   map[string]context.CancelFunc
+	queue    chan string
+	ready    bool
+	ctx      context.Context
+	stop     context.CancelFunc
+	workers  sync.WaitGroup
+	sequence uint64
+
+	workerCount int
+	jobDuration time.Duration
 }
 
-func NewJobService(workerN, queueSize int, logger *slog.Logger) *JobService {
-	s := &JobService{
-		jobs:     make(map[string]*Job),
-		cancels:  make(map[string]context.CancelFunc),
-		queue:    make(chan *Job, queueSize),
-		shutdown: make(chan struct{}),
-		logger:   logger,
-		workerN:  workerN,
+func NewService(workerCount int, queueSize int, jobDuration time.Duration) *Service {
+	if workerCount <= 0 {
+		workerCount = 1
 	}
-	for i := 0; i < workerN; i++ {
-		s.wg.Add(1)
-		go s.worker(i)
+	if queueSize <= 0 {
+		queueSize = 100
 	}
+	if jobDuration <= 0 {
+		jobDuration = 200 * time.Millisecond
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Service{
+		jobs:        make(map[string]Job),
+		cancel:      make(map[string]context.CancelFunc),
+		queue:       make(chan string, queueSize),
+		ready:       true,
+		ctx:         ctx,
+		stop:        cancel,
+		workerCount: workerCount,
+		jobDuration: jobDuration,
+	}
+
+	for i := 0; i < workerCount; i++ {
+		s.workers.Add(1)
+		go s.worker(i + 1)
+	}
+
 	return s
 }
 
-func (s *JobService) Submit(jobType string) (*Job, error) {
-	select {
-	case <-s.shutdown:
-		return nil, ErrServiceShutdown
-	default:
+func (s *Service) SubmitJob(jobType string) (Job, error) {
+	if jobType == "" {
+		return Job{}, ErrInvalidJobType
 	}
 
-	job := &Job{
-		ID:        uuid.NewString(),
-		Type:      jobType,
-		Status:    StatusPending,
-		CreatedAt: time.Now().UTC(),
-		UpdatedAt: time.Now().UTC(),
-	}
-
-	snapshot := *job
+	now := time.Now().UTC()
+	id := s.nextID()
+	job := Job{ID: id, Type: jobType, Status: StatusPending, CreatedAt: now, UpdatedAt: now}
 
 	s.mu.Lock()
-	s.jobs[job.ID] = job
+	if !s.ready {
+		s.mu.Unlock()
+		return Job{}, ErrShuttingDown
+	}
+	s.jobs[id] = job
 	s.mu.Unlock()
 
-	s.logger.Info("job submitted", "id", job.ID, "type", job.Type)
-
 	select {
-	case s.queue <- job:
-	case <-s.shutdown:
-		s.mu.Lock()
-		delete(s.jobs, job.ID)
-		s.mu.Unlock()
-		return nil, ErrServiceShutdown
+	case s.queue <- id:
+		log.Printf("job created id=%s type=%s", id, jobType)
+		return job, nil
 	default:
 		s.mu.Lock()
-		delete(s.jobs, job.ID)
+		delete(s.jobs, id)
 		s.mu.Unlock()
-		return nil, errors.New("job queue full, try again later")
+		return Job{}, ErrQueueFull
 	}
-
-	return &snapshot, nil
 }
 
-func (s *JobService) GetJob(id string) (Job, error) {
+func (s *Service) GetJob(id string) (Job, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	j, ok := s.jobs[id]
+	job, ok := s.jobs[id]
 	if !ok {
-		return Job{}, ErrJobNotFound
+		return Job{}, ErrNotFound
 	}
-	return *j, nil
+	return job, nil
 }
 
-func (s *JobService) ListJobs() []Job {
+func (s *Service) ListJobs() []Job {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]Job, 0, len(s.jobs))
-	for _, j := range s.jobs {
-		out = append(out, *j)
+	jobs := make([]Job, 0, len(s.jobs))
+	for _, job := range s.jobs {
+		jobs = append(jobs, job)
 	}
-	slices.SortFunc(out, func(a, b Job) int {
-		return b.CreatedAt.Compare(a.CreatedAt)
+	s.mu.RUnlock()
+
+	sort.Slice(jobs, func(i, j int) bool {
+		if jobs[i].CreatedAt.Equal(jobs[j].CreatedAt) {
+			return jobs[i].ID < jobs[j].ID
+		}
+		return jobs[i].CreatedAt.Before(jobs[j].CreatedAt)
 	})
-	return out
+	return jobs
 }
 
-func (s *JobService) CancelJob(id string) error {
+func (s *Service) CancelJob(id string) (Job, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	j, ok := s.jobs[id]
+	job, ok := s.jobs[id]
 	if !ok {
-		return ErrJobNotFound
+		s.mu.Unlock()
+		return Job{}, ErrNotFound
 	}
-
-	switch j.Status {
-	case StatusCompleted, StatusFailed:
-		return ErrJobAlreadyDone
-	case StatusCancelled:
-		return nil
+	if isTerminal(job.Status) {
+		s.mu.Unlock()
+		return Job{}, ErrInvalidState
 	}
+	job.Status = StatusCancelled
+	job.UpdatedAt = time.Now().UTC()
+	s.jobs[id] = job
+	cancel := s.cancel[id]
+	delete(s.cancel, id)
+	s.mu.Unlock()
 
-	if cancel, ok := s.cancels[id]; ok {
+	if cancel != nil {
 		cancel()
-		delete(s.cancels, id)
 	}
-
-	s.updateStatus(j, StatusCancelled)
-	s.logger.Info("job cancelled", "id", id)
-	return nil
+	log.Printf("job cancelled id=%s", id)
+	return job, nil
 }
 
-func (s *JobService) Ready() bool {
-	select {
-	case <-s.shutdown:
-		return false
-	default:
-		return true
-	}
+func (s *Service) Ready() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.ready
 }
 
-func (s *JobService) GracefulStop(timeout time.Duration) error {
-	s.once.Do(func() {
-		s.logger.Info("service shutting down")
-		close(s.shutdown)
-		close(s.queue)
-	})
+func (s *Service) Shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	if !s.ready {
+		s.mu.Unlock()
+	} else {
+		s.ready = false
+		s.mu.Unlock()
+		log.Printf("shutdown started")
+	}
+
+	s.stop()
 
 	done := make(chan struct{})
 	go func() {
-		s.wg.Wait()
+		s.workers.Wait()
 		close(done)
 	}()
 
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-
 	select {
 	case <-done:
-		s.logger.Info("service shutdown complete")
+		log.Printf("shutdown completed")
 		return nil
-	case <-timer.C:
-		s.logger.Warn("graceful shutdown timed out", "timeout", timeout)
-		return errors.New("graceful shutdown timed out: workers did not finish")
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
-func (s *JobService) Stop() {
-	s.once.Do(func() {
-		s.logger.Info("service shutting down")
-		close(s.shutdown)
-		close(s.queue)
-	})
-	s.wg.Wait()
-	s.logger.Info("service shutdown complete")
-}
-
-func (s *JobService) worker(id int) {
-	defer s.wg.Done()
-
-	defer func() {
-		if r := recover(); r != nil {
-			s.logger.Error("worker recovered from panic",
-				"worker_id", id, "panic", r)
-		}
-	}()
-
-	s.logger.Info("worker started", "worker_id", id)
-
-	for job := range s.queue {
-		ctx, cancel := context.WithCancel(context.Background())
-
-		s.mu.Lock()
-		if job.Status == StatusCancelled {
-			cancel()
-			s.mu.Unlock()
-			continue
-		}
-		s.cancels[job.ID] = cancel
-		s.updateStatus(job, StatusRunning)
-		s.mu.Unlock()
-
-		s.logger.Info("job started", "worker_id", id, "job_id", job.ID)
-		err := s.execute(ctx, job)
-
-		s.mu.Lock()
-		delete(s.cancels, job.ID)
-		if job.Status != StatusCancelled {
-			if err != nil {
-				s.updateStatus(job, StatusFailed)
-				s.logger.Error("job failed", "job_id", job.ID, "error", err)
-			} else {
-				s.updateStatus(job, StatusCompleted)
-				s.logger.Info("job completed", "job_id", job.ID)
+func (s *Service) worker(workerNumber int) {
+	defer s.workers.Done()
+	workerID := fmt.Sprintf("worker-%d", workerNumber)
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case jobID := <-s.queue:
+			if !s.Ready() {
+				continue
 			}
+			jobCtx, ok := s.markRunning(jobID)
+			if !ok {
+				continue
+			}
+			log.Printf("job started id=%s worker=%s", jobID, workerID)
+			err := s.execute(jobCtx)
+			if err != nil {
+				s.markFailed(jobID, err)
+				continue
+			}
+			s.markCompleted(jobID)
 		}
-		s.mu.Unlock()
-
-		cancel()
 	}
-
-	s.logger.Info("worker stopped", "worker_id", id)
 }
 
-func (s *JobService) execute(ctx context.Context, job *Job) error {
-	stages := []struct {
-		name     string
-		duration time.Duration
-	}{
-		{"initialising", 300 * time.Millisecond},
-		{"processing", 500 * time.Millisecond},
-		{"finalising", 200 * time.Millisecond},
+func (s *Service) execute(ctx context.Context) error {
+	stages := 5
+	stageDuration := s.jobDuration / time.Duration(stages)
+	if stageDuration <= 0 {
+		stageDuration = time.Millisecond
 	}
-
-	for _, stage := range stages {
-		timer := time.NewTimer(stage.duration)
+	for i := 0; i < stages; i++ {
 		select {
 		case <-ctx.Done():
-			timer.Stop()
 			return ctx.Err()
-		case <-timer.C:
-			s.logger.Debug("job stage complete",
-				"job_id", job.ID, "stage", stage.name)
+		case <-time.After(stageDuration):
 		}
 	}
 	return nil
 }
 
-func (s *JobService) updateStatus(j *Job, status string) {
-	j.Status = status
-	j.UpdatedAt = time.Now().UTC()
+func (s *Service) markRunning(id string) (context.Context, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[id]
+	if !ok || job.Status != StatusPending || !s.ready {
+		return nil, false
+	}
+	job.Status = StatusRunning
+	job.UpdatedAt = time.Now().UTC()
+	jobCtx, cancel := context.WithCancel(context.Background())
+	s.cancel[id] = cancel
+	s.jobs[id] = job
+	return jobCtx, true
+}
+
+func (s *Service) markCompleted(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[id]
+	if !ok || job.Status != StatusRunning {
+		return false
+	}
+	job.Status = StatusCompleted
+	job.UpdatedAt = time.Now().UTC()
+	s.jobs[id] = job
+	delete(s.cancel, id)
+	log.Printf("job completed id=%s", id)
+	return true
+}
+
+func (s *Service) markFailed(id string, err error) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[id]
+	if !ok || job.Status != StatusRunning {
+		return false
+	}
+	job.Status = StatusFailed
+	job.UpdatedAt = time.Now().UTC()
+	s.jobs[id] = job
+	delete(s.cancel, id)
+	log.Printf("job failed id=%s error=%v", id, err)
+	return true
+}
+
+func (s *Service) nextID() string {
+	n := atomic.AddUint64(&s.sequence, 1)
+	return fmt.Sprintf("job-%d", n)
+}
+
+func isTerminal(status string) bool {
+	switch status {
+	case StatusCompleted, StatusFailed, StatusCancelled:
+		return true
+	default:
+		return false
+	}
 }
